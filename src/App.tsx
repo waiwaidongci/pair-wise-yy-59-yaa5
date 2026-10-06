@@ -21,21 +21,38 @@ import {
   Eye,
   FileCheck2,
   FileText,
+  GitCompareArrows,
+  History as HistoryIcon,
   Highlighter,
   Layers3,
+  Lock,
   Menu,
-  PanelLeftClose,
+  RefreshCw,
+  RotateCcw,
   ScanSearch,
   ShieldCheck,
   Stamp,
   Tags,
-  UploadCloud
+  UploadCloud,
+  Users,
+  X,
+  Zap
 } from 'lucide-react';
 import * as pdfjs from 'pdfjs-dist';
 import workerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
-import { Badge, Button, Card, Dialog, Tabs, X } from './components/ui';
-import { useDisclosureStore, type DisclosureRecord } from './store';
+import { Badge, Button, Card, Dialog, Tabs } from './components/ui';
+import {
+  REVIEW_CHECKS,
+  REVIEWERS,
+  approvalGate,
+  isSnapshotFresh,
+  type DisclosureRecord,
+  type HistoryKind,
+  type ProcessRecord,
+  type ReviewerId
+} from './reviewModel';
+import { useDisclosureStore } from './store';
 
 pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
 
@@ -47,8 +64,27 @@ const bundleQuery = async () => ({
   ]
 });
 
+const historyIcon: Record<HistoryKind, typeof FileText> = {
+  region: Highlighter,
+  check: ClipboardCheck,
+  snapshot: GitCompareArrows,
+  submit: FileCheck2,
+  conflict: AlertTriangle,
+  release: ShieldCheck,
+  upgrade: Zap,
+  recovery: RefreshCw,
+  compare: Eye,
+  draft: Users,
+  system: Stamp
+};
+
 function AppShell() {
   const [mobileNav, setMobileNav] = useState(false);
+  const recoverPendingUpgrades = useDisclosureStore((state) => state.recoverPendingUpgrades);
+  useEffect(() => {
+    // 启动时恢复写入失败后挂起的旧草稿升级（幂等，重复调用安全）
+    recoverPendingUpgrades();
+  }, [recoverPendingUpgrades]);
   const links = [
     { to: '/', label: '文档集', icon: Layers3 },
     { to: '/review/$documentId', label: '去密审阅', icon: Highlighter },
@@ -76,14 +112,14 @@ function AppShell() {
           </div>
           <nav>
             {links.map(({ to, label, icon: Icon }) => (
-              <Link key={to} to={to as '/'} activeProps={{ className: 'active' }} onClick={() => setMobileNav(false)}>
+              <Link key={to} to={to as '/'} activeProps={{ className: 'active' }} params={to.includes('$documentId') ? { documentId: 'DOC-00418' } : undefined} onClick={() => setMobileNav(false)}>
                 <Icon size={17} /> <span>{label}</span>
               </Link>
             ))}
           </nav>
           <div className="sidebar-foot">
             <div><ShieldCheck size={16} /><span>审计记录已开启</span></div>
-            <small>草稿自动保存在本机</small>
+            <small>草稿自动保存在本机 · 区域/复核项/快照共用内容版本</small>
           </div>
         </aside>
         <main className="main-content"><Outlet /></main>
@@ -94,6 +130,7 @@ function AppShell() {
 
 function DocumentsPage() {
   const documents = useDisclosureStore((state) => state.documents);
+  const setQualityDocument = useDisclosureStore((state) => state.setQualityDocument);
   const { data } = useQuery({ queryKey: ['document-queues'], queryFn: bundleQuery });
   const [filter, setFilter] = useState('全部');
   const visible = filter === '全部' ? documents : documents.filter((doc) => doc.status === filter);
@@ -118,21 +155,34 @@ function DocumentsPage() {
             <span>{visible.length} 份文档</span>
           </div>
           <div className="document-table">
-            {visible.map((doc) => (
-              <div className="document-row" key={doc.id}>
-                <div className="file-icon"><FileText size={19} /></div>
-                <div className="doc-main">
-                  <strong>{doc.title}</strong>
-                  <span>{doc.id} · {doc.bundle} · {doc.size}</span>
+            {visible.map((doc) => {
+              const fresh = isSnapshotFresh(doc);
+              const locked = doc.review.lock?.version === doc.review.contentVersion;
+              return (
+                <div className="document-row" key={doc.id}>
+                  <div className="file-icon"><FileText size={19} /></div>
+                  <div className="doc-main">
+                    <strong>{doc.title}</strong>
+                    <span>{doc.id} · {doc.bundle} · {doc.size}</span>
+                    <span className="version-line">
+                      <i className={`version-dot ${fresh ? 'fresh' : doc.review.snapshot ? 'stale' : 'none'}`} />
+                      内容版本 v{doc.review.contentVersion}
+                      {locked && <em className="lock-mini"><Lock size={10} /> {REVIEWERS.find((r) => r.id === doc.review.lock?.by)?.name}已锁定</em>}
+                      {doc.review.snapshot && <em className={fresh ? 'snap-mini ok' : 'snap-mini bad'}>{fresh ? `快照 v${doc.review.snapshot.version} 有效` : `快照 v${doc.review.snapshot.version} 已失效`}</em>}
+                    </span>
+                  </div>
+                  <div className="doc-field"><span>密级</span><Badge tone={doc.classification === '严格机密' ? 'red' : doc.classification === '机密' ? 'amber' : 'neutral'}>{doc.classification}</Badge></div>
+                  <div className="doc-field"><span>负责人员</span><strong>{doc.owner}</strong></div>
+                  <div className="doc-field"><span>状态</span><Badge tone={doc.status === '可发布' ? 'green' : doc.status === '待质检' ? 'amber' : 'blue'}>{doc.status}</Badge></div>
+                  <div className="doc-actions">
+                    <Link to="/review/$documentId" params={{ documentId: doc.id }}><Button variant="outline">审阅</Button></Link>
+                    {doc.status !== '去密中' && (
+                      <Link to="/quality" onClick={() => setQualityDocument(doc.id)}><Button variant="ghost">质控</Button></Link>
+                    )}
+                  </div>
                 </div>
-                <div className="doc-field"><span>密级</span><Badge tone={doc.classification === '严格机密' ? 'red' : doc.classification === '机密' ? 'amber' : 'neutral'}>{doc.classification}</Badge></div>
-                <div className="doc-field"><span>负责人员</span><strong>{doc.owner}</strong></div>
-                <div className="doc-field"><span>状态</span><Badge tone={doc.status === '可发布' ? 'green' : doc.status === '待质检' ? 'amber' : 'blue'}>{doc.status}</Badge></div>
-                <div className="doc-actions">
-                  <Link to="/review/$documentId" params={{ documentId: doc.id }}><Button variant="outline">审阅</Button></Link>
-                </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         </Card>
         <aside className="side-stack">
@@ -149,7 +199,7 @@ function DocumentsPage() {
           <Card className="audit-card">
             <div className="card-title"><ShieldCheck size={17} /><strong>最近操作</strong></div>
             <p><b>09:48</b> 林清确认 DOC-00418 的合同价款遮蔽区域。</p>
-            <p><b>09:31</b> 周叙提交会议纪要待质检。</p>
+            <p><b>09:31</b> 沈纹先到锁定 DOC-00427 v3，等待复审。</p>
             <p><b>08:54</b> 顾言导出 DOC-00435 发布清单。</p>
           </Card>
         </aside>
@@ -256,11 +306,13 @@ function PdfPage({ pageNumber, redacted = false, onDraw }: { pageNumber: number;
 function ReviewPage() {
   const { documentId } = useParams({ from: '/review/$documentId' });
   const navigate = useNavigate();
-  const { documents, activePage, redactionMode, activeRedactionId } = useDisclosureStore();
+  const documents = useDisclosureStore((state) => state.documents);
+  const { activePage, redactionMode, activeRedactionId } = useDisclosureStore();
   const store = useDisclosureStore();
   const doc = documents.find((item) => item.id === documentId) ?? documents[0];
   const pageRegions = doc.redactions.filter((item) => item.page === activePage);
   const active = doc.redactions.find((item) => item.id === activeRedactionId);
+  const fresh = isSnapshotFresh(doc);
   const [dialogOpen, setDialogOpen] = useState(false);
   const [reason, setReason] = useState('商业秘密');
   const [privilege, setPrivilege] = useState('合同保密');
@@ -271,11 +323,19 @@ function ReviewPage() {
           <Button variant="ghost" onClick={() => navigate({ to: '/' })}><ArrowLeft size={16} /></Button>
           <div><small>{doc.id} / 去密审阅</small><h1>{doc.title}</h1></div>
           <Badge tone={doc.classification === '严格机密' ? 'red' : 'amber'}>{doc.classification}</Badge>
+          <Badge tone="blue">内容版本 v{doc.review.contentVersion}</Badge>
+          <Badge tone={fresh ? 'green' : doc.review.snapshot ? 'amber' : 'neutral'}>
+            {fresh ? `发布快照 v${doc.review.snapshot?.version} 有效` : doc.review.snapshot ? `快照 v${doc.review.snapshot.version} 已失效` : '尚无发布快照'}
+          </Badge>
         </div>
         <div className="review-actions">
           <Button variant="outline" onClick={() => store.toggleRedactionMode()} className={redactionMode ? 'active-button' : ''}><Highlighter size={16} /> {redactionMode ? '取消绘制' : '绘制去密区'}</Button>
           <Button variant="outline" onClick={() => setDialogOpen(true)}><FileCheck2 size={16} /> 发布前校验</Button>
-          <Button><Check size={16} /> 提交质检</Button>
+          <Button onClick={() => {
+            store.submitForQa();
+            store.setQualityDocument(doc.id);
+            navigate({ to: '/quality' });
+          }}><Check size={16} /> 提交质检</Button>
         </div>
       </header>
       <div className="review-layout">
@@ -292,7 +352,7 @@ function ReviewPage() {
           <div className="viewer-toolbar">
             <div><button onClick={() => store.setPage(Math.max(1, activePage - 1))} disabled={activePage === 1}><ChevronLeft size={16} /></button><strong>{activePage} / {doc.pages}</strong><button onClick={() => store.setPage(Math.min(doc.pages, activePage + 1))} disabled={activePage === doc.pages}><ChevronRight size={16} /></button></div>
             <span>125%</span>
-            <span>原页 · 掩码叠加</span>
+            <span>原页 · 掩码叠加 · 任一区域改动都会提升版本并使发布快照失效</span>
           </div>
           <div className="pdf-stage">
             <PdfPage
@@ -324,7 +384,7 @@ function ReviewPage() {
               <Button variant="outline"><Copy size={15} /> 批量复制到同类页</Button>
             </>
           ) : <p className="muted">在文档页面上选择一个去密区域查看属性。</p>}
-          <div className="rule-note"><AlertTriangle size={16} /><span>发布版本不得包含原始文本层或图片残片。</span></div>
+          <div className="rule-note"><AlertTriangle size={16} /><span>确认/新增区域会提升内容版本：旧发布快照立即失效，双人须重新对照原页与发布页。</span></div>
         </aside>
       </div>
       <Dialog.Root open={dialogOpen} onOpenChange={setDialogOpen}>
@@ -334,9 +394,10 @@ function ReviewPage() {
             <Dialog.Title>发布前校验</Dialog.Title>
             <Dialog.Description>系统将核对原始页与发布页的一致性，并检查元数据残留。</Dialog.Description>
             <div className="dialog-checks">
-              <p><Check /> {doc.redactions.length} 个去密区域已定位</p>
+              <p><Check /> {doc.redactions.length} 个去密区域已定位（当前 v{doc.review.contentVersion}）</p>
               <p><Check /> 文档版本与操作者记录完整</p>
               <p className={doc.redactions.some((item) => item.status === 'draft') ? 'failed' : ''}><AlertTriangle /> {doc.redactions.some((item) => item.status === 'draft') ? '仍有未确认区域' : '所有区域已确认'}</p>
+              <p className={fresh ? '' : 'failed'}>{fresh ? <Check /> : <AlertTriangle />} {fresh ? '发布快照与当前版本一致' : '发布快照缺失或已失效，需在发布质控页重新对照生成'}</p>
             </div>
             <Dialog.Close asChild><Button>返回检查 <X size={15} /></Button></Dialog.Close>
           </Dialog.Content>
@@ -346,37 +407,356 @@ function ReviewPage() {
   );
 }
 
-function QualityPage() {
-  const { documents } = useDisclosureStore();
+type Notice = { tone: 'ok' | 'err' | 'info'; text: string };
+
+function ReviewerPanel({ doc, reviewerId, notices, setNotices }: {
+  doc: DisclosureRecord;
+  reviewerId: ReviewerId;
+  notices: Record<string, Notice>;
+  setNotices: React.Dispatch<React.SetStateAction<Record<string, Notice>>>;
+}) {
   const store = useDisclosureStore();
-  const doc = documents[1];
-  const checks = [
-    { id: 'forbidden-terms', label: '全文禁词与姓名复核', detail: '扫描原始页和发布页文本层' },
-    { id: 'page-number', label: '页序与页码连续性', detail: '检查拆页、合并及漏页情况' },
-    { id: 'image-boundary', label: '图像边界残片', detail: '逐页比较遮蔽边界 2mm 区域' },
-    { id: 'metadata', label: '文档元数据清理', detail: '作者、修订人、批注和隐藏字段' }
-  ];
+  const reviewer = REVIEWERS.find((item) => item.id === reviewerId)!;
+  const review = doc.review;
+  const wc = review.workingCopies.find((item) => item.reviewerId === reviewerId) ?? null;
+  const currentConclusion = review.conclusions.find((c) => c.reviewerId === reviewerId && c.version === review.contentVersion) ?? null;
+  const isConflict = review.conflict?.reviewerId === reviewerId;
+  const compared = review.comparedBy[reviewerId] === review.contentVersion;
+  const fresh = isSnapshotFresh(doc);
+  const noticeKey = `submit-${reviewerId}`;
+  const [busy, setBusy] = useState(false);
+  const notice = notices[noticeKey];
+
+  const submit = async () => {
+    setBusy(true);
+    const result = await store.submitConclusion(doc.id, reviewerId);
+    setBusy(false);
+    if (result.ok) setNotices((prev) => ({ ...prev, [noticeKey]: { tone: 'ok', text: '提交成功：本版本已记录你的复核结论' } }));
+    else if (result.code === 'conflict') setNotices((prev) => ({ ...prev, [noticeKey]: { tone: 'err', text: result.text ?? '提交冲突，现场已保留' } }));
+    else setNotices((prev) => ({ ...prev, [noticeKey]: { tone: 'err', text: result.text ?? '暂不能提交' } }));
+  };
+
   return (
-    <div className="page">
-      <header className="page-heading"><div><small>QUALITY ASSURANCE / SIDE-BY-SIDE</small><h1>发布质控双人复核</h1><p>并排检查原始页与发布页，所有差异必须留下复核结论。</p></div><Button><FileCheck2 size={16} /> 导出发布清单</Button></header>
+    <Card className={`reviewer-card ${isConflict ? 'in-conflict' : ''} ${currentConclusion?.decision === 'approve' ? 'approved' : ''}`}>
+      <div className="reviewer-head">
+        <div className="reviewer-avatar">{reviewer.name[0]}</div>
+        <div><strong>{reviewer.name}</strong><span>{reviewer.role}</span></div>
+        {currentConclusion ? (
+          <Badge tone={currentConclusion.decision === 'approve' ? 'green' : 'red'}>{currentConclusion.decision === 'approve' ? `已通过 v${currentConclusion.version}` : `退回 v${currentConclusion.version}`} · {currentConclusion.at}</Badge>
+        ) : isConflict ? (
+          <Badge tone="red">提交冲突 · 现场保留</Badge>
+        ) : wc ? (
+          <Badge tone="blue">工作稿基于 v{wc.basedOnVersion}</Badge>
+        ) : (
+          <Badge tone="neutral">未打开工作稿</Badge>
+        )}
+      </div>
+      {!currentConclusion && (
+        <div className="reviewer-body">
+          {!wc ? (
+            <Button variant="outline" onClick={() => store.openWorkingCopy(doc.id, reviewerId)}><Users size={14} /> 打开复核工作稿</Button>
+          ) : wc.basedOnVersion !== review.contentVersion ? (
+            <div className="stale-draft">
+              <AlertTriangle size={15} />
+              <div>
+                <strong>工作稿已落后于权威版本</strong>
+                <p>你的工作稿基于 v{wc.basedOnVersion}，区域/复核项已变更到 v{review.contentVersion}。直接提交会产生冲突；请刷新对齐，并在重新对照后再下结论。</p>
+              </div>
+              <Button onClick={() => store.openWorkingCopy(doc.id, reviewerId)}><RefreshCw size={14} /> 刷新对齐到 v{review.contentVersion}</Button>
+            </div>
+          ) : (
+            <>
+              <div className="draft-meta">
+                <span>打开于 {wc.openedAt}</span>
+                <span>所见锁：{wc.observedLock ? `${REVIEWERS.find((r) => r.id === wc.observedLock?.by)?.name} @ v${wc.observedLock.version}` : '无'}</span>
+              </div>
+              <div className="decision-toggle">
+                <button className={wc.decision === 'approve' ? 'selected approve' : ''} onClick={() => store.updateWorkingDraft(doc.id, reviewerId, { decision: 'approve' })}><Check size={13} /> 复核通过</button>
+                <button className={wc.decision === 'return' ? 'selected return' : ''} onClick={() => store.updateWorkingDraft(doc.id, reviewerId, { decision: 'return' })}><ArrowLeft size={13} /> 退回补件</button>
+              </div>
+              <label className="compare-ack">
+                <input
+                  type="checkbox"
+                  checked={compared}
+                  disabled={!fresh}
+                  onChange={() => store.acknowledgeCompared(doc.id, reviewerId)}
+                />
+                已逐页重新对照原页与发布页（v{review.contentVersion}）
+                {!fresh && <small>快照失效，需先在下方重新生成快照</small>}
+              </label>
+              <Button disabled={busy || !wc.decision} onClick={submit}>
+                {busy ? <RefreshCw size={14} className="spin" /> : <FileCheck2 size={14} />} 提交复核结论
+              </Button>
+            </>
+          )}
+          {notice && <p className={`inline-notice ${notice.tone}`}><AlertTriangle size={13} /> {notice.text}</p>}
+        </div>
+      )}
+    </Card>
+  );
+}
+
+function QualityPage() {
+  const documents = useDisclosureStore((state) => state.documents);
+  const docId = useDisclosureStore((state) => state.qualityDocumentId);
+  const store = useDisclosureStore();
+  const doc = documents.find((item) => item.id === docId) ?? documents[0];
+  const review = doc.review;
+  const fresh = isSnapshotFresh(doc);
+  const gate = approvalGate(doc);
+  const [page, setPage] = useState(1);
+  const [notices, setNotices] = useState<Record<string, Notice>>({});
+  const pageRegions = doc.redactions.filter((item) => item.page === page);
+  const snapshotOp = store.snapshotOps[doc.id];
+  const upgradeOp = store.upgradeOps[doc.id];
+  const faults = store.injectedFaults;
+  const submittedCount = review.conclusions.filter((c) => c.version === review.contentVersion && c.decision === 'approve').length;
+
+  return (
+    <div className="page quality-page">
+      <header className="page-heading">
+        <div><small>QUALITY ASSURANCE / SIDE-BY-SIDE</small><h1>发布质控双人复核</h1><p>去密区域、复核项与发布快照共用同一内容版本；先到提交者锁定版本，后到者遇冲突且现场保留。</p></div>
+        <Button><FileCheck2 size={16} /> 导出发布清单</Button>
+      </header>
+
+      <Card className="demo-toolbar">
+        <div className="card-title"><Zap size={15} /><strong>并发 / 故障演练台</strong><span>不会影响真实数据，仅用于演示版本规则</span></div>
+        <div className="demo-buttons">
+          <Button variant="outline" onClick={() => store.seedLegacyDraft(false)}>注入旧草稿（升级成功）</Button>
+          <Button variant="outline" onClick={() => store.seedLegacyDraft(true)}>注入旧草稿（首次写入失败 → 按编号重试）</Button>
+          <Button variant="outline" onClick={() => store.setInjectedFault({ snapshot: 'snapshot-fail' })}>下次快照：写入失败</Button>
+          <Button variant="outline" onClick={() => store.setInjectedFault({ snapshot: 'snapshot-lost' })}>下次快照：响应丢失</Button>
+          <Button variant="ghost" onClick={() => store.resetDemo()}><RotateCcw size={14} /> 重置演示数据</Button>
+        </div>
+        {(faults.snapshot || faults.upgrade) && (
+          <p className="fault-armed"><AlertTriangle size={13} /> 已挂起故障：
+            {faults.snapshot === 'snapshot-fail' && ' 快照写入将失败（可用按钮重试，不重复留快照）'}
+            {faults.snapshot === 'snapshot-lost' && ' 快照响应将丢失（自动按幂等键重试恢复）'}
+            {faults.upgrade === 'upgrade-fail' && ' 旧草稿升级首次写入将失败'}
+          </p>
+        )}
+      </Card>
+
+      <div className="quality-doc-tabs">
+        {documents.map((item) => (
+          <button key={item.id} className={item.id === doc.id ? 'active' : ''} onClick={() => { store.setQualityDocument(item.id); setPage(1); setNotices({}); }}>
+            <strong>{item.id}</strong><span>{item.title}</span><i className={`tab-dot ${isSnapshotFresh(item) ? 'fresh' : item.review.snapshot ? 'stale' : 'none'}`} />
+          </button>
+        ))}
+      </div>
+
+      {review.pendingUpgrade && (
+        <div className="upgrade-banner">
+          <Zap size={16} />
+          <div>
+            <strong>检测到旧版草稿（{doc.id}）</strong>
+            <span>升级会保留原去密区域、复核勾选与处理记录，升级写入按文档编号幂等恢复，不会重复生成快照。</span>
+            {upgradeOp && <small>状态：{upgradeOp.message}（尝试 {upgradeOp.attempts} 次）</small>}
+          </div>
+          <Button variant="outline" onClick={() => store.retryUpgrade(doc.id)} disabled={upgradeOp?.status === 'running'}><RefreshCw size={14} /> 按文档编号重试恢复</Button>
+        </div>
+      )}
+      {!review.pendingUpgrade && upgradeOp?.status === 'done' && (
+        <div className="upgrade-banner done">
+          <Check size={16} />
+          <div><strong>{doc.id} 旧草稿升级完成</strong><span>{upgradeOp.message}</span></div>
+        </div>
+      )}
+
       <div className="comparison-banner">
-        <div><Eye size={17} /><strong>{doc.title}</strong><span>版本 3.4 · 双人复核</span></div>
-        <Badge tone="amber">等待复审员 2/2</Badge>
+        <div><Eye size={17} /><strong>{doc.title}</strong><span>{doc.id} · 内容版本 v{review.contentVersion} · 双人复核 {submittedCount}/2 已通过</span></div>
+        <div className="banner-right">
+          <label className="actor-switch">
+            当前操作者
+            <select value={store.activeReviewer} onChange={(event) => store.setActiveReviewer(event.target.value as ReviewerId)}>
+              {REVIEWERS.map((reviewer) => <option key={reviewer.id} value={reviewer.id}>{reviewer.name}（{reviewer.role}）</option>)}
+            </select>
+          </label>
+          {review.lock && review.lock.version === review.contentVersion ? (
+            <Badge tone="blue"><Lock size={11} /> v{review.lock.version} 已被 {REVIEWERS.find((r) => r.id === review.lock?.by)?.name} 先到锁定（{review.lock.at}）</Badge>
+          ) : (
+            <Badge tone="amber">版本未锁定 · 等待先到提交</Badge>
+          )}
+        </div>
       </div>
+
+      <div className="snapshot-bar">
+        <div className="snapshot-state">
+          {fresh ? (
+            <>
+              <i className="snap-led fresh" />
+              <strong>发布快照有效</strong>
+              <span>v{review.snapshot!.version} · 指纹 {review.snapshot!.fingerprint} · {REVIEWERS.find((r) => r.id === review.snapshot!.createdBy)?.name} 于 {review.snapshot!.createdAt} 生成</span>
+            </>
+          ) : review.snapshot ? (
+            <>
+              <i className="snap-led stale" />
+              <strong>发布快照已失效</strong>
+              <span>快照基于 v{review.snapshot.version}，区域/复核项已变更到 v{review.contentVersion}；必须重新对照后才能批准</span>
+            </>
+          ) : (
+            <>
+              <i className="snap-led none" />
+              <strong>尚无发布快照</strong>
+              <span>并排核对原页与发布页后生成快照，快照将绑定当前版本与内容指纹</span>
+            </>
+          )}
+        </div>
+        <Button variant={fresh ? 'outline' : 'primary'} disabled={snapshotOp?.status === 'running' || snapshotOp?.status === 'recovering'} onClick={() => store.createSnapshot(doc.id, store.activeReviewer)}>
+          <RefreshCw size={14} className={snapshotOp?.status === 'running' || snapshotOp?.status === 'recovering' ? 'spin' : ''} />
+          {fresh ? '重新对照并重建快照' : '原页/发布页对照完成，生成快照'}
+        </Button>
+      </div>
+      {snapshotOp && (
+        <div className={`op-banner ${snapshotOp.status === 'failed' ? 'failed' : snapshotOp.status === 'ok' ? 'ok' : 'running'}`}>
+          {snapshotOp.status === 'failed' ? <AlertTriangle size={14} /> : snapshotOp.status === 'ok' ? <Check size={14} /> : <RefreshCw size={14} className="spin" />}
+          <span>{snapshotOp.message}</span>
+          {snapshotOp.status === 'failed' && <Button variant="outline" onClick={() => store.createSnapshot(doc.id, store.activeReviewer)}>按 {doc.id} 重试</Button>}
+        </div>
+      )}
+
       <div className="compare-grid">
-        <Card className="compare-panel"><div className="compare-head"><span>原始页</span><Badge tone="neutral">源文件</Badge></div><div className="compare-page"><PdfPage pageNumber={1} /></div></Card>
-        <Card className="compare-panel"><div className="compare-head"><span>发布页</span><Badge tone="green">已遮蔽</Badge></div><div className="compare-page redacted-preview"><PdfPage pageNumber={1} redacted /><div className="demo-mask mask-one" /><div className="demo-mask mask-two" /></div></Card>
+        <Card className="compare-panel">
+          <div className="compare-head">
+            <span>原始页</span>
+            <div className="page-switcher"><button onClick={() => setPage((p) => Math.max(1, p - 1))} disabled={page === 1}><ChevronLeft size={14} /></button><strong>{page}/{doc.pages}</strong><button onClick={() => setPage((p) => Math.min(doc.pages, p + 1))} disabled={page === doc.pages}><ChevronRight size={14} /></button></div>
+            <Badge tone="neutral">源文件</Badge>
+          </div>
+          <div className="compare-page"><PdfPage pageNumber={page} /></div>
+        </Card>
+        <Card className="compare-panel">
+          <div className="compare-head"><span>发布页</span><Badge tone="green">{fresh ? `按 v${review.contentVersion} 快照遮蔽` : '遮蔽与当前版本不一致'}</Badge></div>
+          <div className="compare-page redacted-preview">
+            <PdfPage pageNumber={page} redacted />
+            {pageRegions.map((region) => (
+              <i key={region.id} className={`redaction-mask ${region.status}`} style={{ left: `${region.x * 100}%`, top: `${region.y * 100}%`, width: `${region.width * 100}%`, height: `${region.height * 100}%` }} />
+            ))}
+          </div>
+        </Card>
       </div>
+
+      <div className="reviewer-grid">
+        {REVIEWERS.map((reviewer) => (
+          <ReviewerPanel key={reviewer.id} doc={doc} reviewerId={reviewer.id} notices={notices} setNotices={setNotices} />
+        ))}
+      </div>
+
+      {review.conflict && <ConflictCard doc={doc} />}
+
       <div className="quality-bottom">
-        <Card className="checks-card"><div className="card-title"><ClipboardCheck size={17} /><strong>发布前校验项</strong></div>{checks.map((check) => <button className="check-row" key={check.id} onClick={() => store.toggleReviewCheck(check.id)}><span className={store.reviewChecks[check.id] ? 'checked' : ''}>{store.reviewChecks[check.id] && <Check size={13} />}</span><div><strong>{check.label}</strong><small>{check.detail}</small></div></button>)}</Card>
-        <Card className="decision-card"><div className="card-title"><ShieldCheck size={17} /><strong>复核结论</strong></div><p>本批次共有 <b>{doc.redactions.length}</b> 个去密区域，其中已确认 {doc.redactions.filter((item) => item.status === 'confirmed').length} 个。</p><label><input type="checkbox" checked={store.metadataCleaned} onChange={store.toggleMetadata} /> 已确认元数据清理</label><div className="decision-actions"><Button variant="outline"><ArrowLeft size={15} /> 退回补件</Button><Button disabled={!store.metadataCleaned || Object.values(store.reviewChecks).some((value) => !value)} onClick={store.markReady}><Check size={15} /> 通过并标记可发布</Button></div></Card>
+        <Card className="checks-card">
+          <div className="card-title"><ClipboardCheck size={17} /><strong>发布前校验项（权威版本）</strong><span>勾选改动立即提升内容版本</span></div>
+          {REVIEW_CHECKS.map((check) => (
+            <button className="check-row" key={check.id} onClick={() => store.toggleReviewCheck(doc.id, check.id)}>
+              <span className={review.checks[check.id] ? 'checked' : ''}>{review.checks[check.id] && <Check size={13} />}</span>
+              <div><strong>{check.label}</strong><small>{check.detail}</small></div>
+              <Badge tone={review.checks[check.id] ? 'green' : 'neutral'}>{review.checks[check.id] ? 'v' + review.contentVersion : '未通过'}</Badge>
+            </button>
+          ))}
+          <label className="metadata-row">
+            <input type="checkbox" checked={review.metadataCleaned} onChange={() => store.toggleMetadata(doc.id)} />
+            <div><strong>已确认元数据清理</strong><small>作者、修订人、批注和隐藏字段（改动同样提升版本）</small></div>
+          </label>
+        </Card>
+
+        <Card className="decision-card">
+          <div className="card-title"><ShieldCheck size={17} /><strong>发布门禁</strong></div>
+          <div className="gate-list">
+            <GateRow ok={!!review.snapshot} text="已生成发布快照" />
+            <GateRow ok={fresh} text={`快照与当前 v${review.contentVersion} 区域/复核项指纹一致`} />
+            <GateRow ok={REVIEW_CHECKS.every((c) => review.checks[c.id])} text="4 项复核项全部通过" />
+            <GateRow ok={review.metadataCleaned} text="元数据清理已确认" />
+            {REVIEWERS.map((reviewer) => {
+              const c = review.conclusions.find((item) => item.reviewerId === reviewer.id && item.version === review.contentVersion);
+              return <GateRow key={reviewer.id} ok={c?.decision === 'approve'} text={`${reviewer.name} 在 v${review.contentVersion} 提交通过`} />;
+            })}
+            {REVIEWERS.map((reviewer) => (
+              <GateRow key={`cmp-${reviewer.id}`} ok={review.comparedBy[reviewer.id] === review.contentVersion} text={`${reviewer.name} 已逐页重新对照 v${review.contentVersion}`} />
+            ))}
+            <GateRow ok={!review.conflict} text="无未决并发冲突" />
+          </div>
+          {!gate.ready && (
+            <ul className="gate-blockers">
+              {gate.reasons.map((reason) => <li key={reason}><AlertTriangle size={12} /> {reason}</li>)}
+            </ul>
+          )}
+          <div className="decision-actions vertical">
+            <Button disabled={!gate.ready} onClick={() => store.approveRelease(doc.id)}><ShieldCheck size={15} /> 通过并标记可发布</Button>
+            <Button variant="outline" onClick={() => store.resetReviewCycle(doc.id)}><RotateCcw size={15} /> （演练）重置本版本双人结论</Button>
+          </div>
+        </Card>
+
+        <Card className="history-card">
+          <div className="card-title"><HistoryIcon size={17} /><strong>处理记录</strong><span>冲突、升级与恢复均留痕</span></div>
+          <div className="history-list">
+            {review.history.slice(0, 14).map((record: ProcessRecord) => {
+              const Icon = historyIcon[record.kind] ?? FileText;
+              return (
+                <div className={`history-item kind-${record.kind}`} key={record.id}>
+                  <i><Icon size={13} /></i>
+                  <div><p>{record.text}</p><small><b>{record.at}</b> · {record.actor} · v{record.version}</small></div>
+                </div>
+              );
+            })}
+          </div>
+        </Card>
       </div>
     </div>
   );
 }
 
+function GateRow({ ok, text }: { ok: boolean; text: string }) {
+  return (
+    <p className={`gate-row ${ok ? 'ok' : 'blocked'}`}>
+      {ok ? <Check size={13} /> : <X size={13} />} {text}
+    </p>
+  );
+}
+
+function ConflictCard({ doc }: { doc: DisclosureRecord }) {
+  const store = useDisclosureStore();
+  const conflict = doc.review.conflict!;
+  const reviewer = REVIEWERS.find((r) => r.id === conflict.reviewerId)!;
+  const wc = conflict.workingCopy;
+  return (
+    <Card className="conflict-card">
+      <div className="conflict-head">
+        <AlertTriangle size={18} />
+        <div>
+          <strong>{reviewer.name} 的提交发生并发冲突，工作稿现场已保留</strong>
+          <p>{conflict.text}</p>
+        </div>
+        <Badge tone="red">{conflict.reason === 'version-moved' ? '版本已漂移' : conflict.reason === 'locked-by-other' ? '已被先到锁定' : '重复提交'}</Badge>
+      </div>
+      <div className="conflict-scene">
+        <div className="scene-col">
+          <span>提交现场</span>
+          <p>基于版本 <b>v{conflict.submittedVersion}</b> · 当前权威版本 <b>v{conflict.currentVersion}</b></p>
+          <p>结论：<b>{wc.decision === 'approve' ? '复核通过' : wc.decision === 'return' ? '退回补件' : '未选择'}</b> · 工作稿打开于 {wc.openedAt}</p>
+          <p>所见锁：{conflict.lock ? `${REVIEWERS.find((r) => r.id === conflict.lock?.by)?.name} 于 ${conflict.lock.at} 锁定 v${conflict.lock.version}` : '无'} </p>
+        </div>
+        <div className="scene-col">
+          <span>勾选现场（原样保留）</span>
+          <ul>
+            {REVIEW_CHECKS.map((check) => (
+              <li key={check.id} className={wc.checks[check.id] ? 'on' : 'off'}>
+                {wc.checks[check.id] ? <Check size={12} /> : <X size={12} />} {check.label}
+              </li>
+            ))}
+            <li className={wc.metadataAck ? 'on' : 'off'}>{wc.metadataAck ? <Check size={12} /> : <X size={12} />} 元数据清理确认</li>
+          </ul>
+        </div>
+      </div>
+      <div className="conflict-actions">
+        <Button onClick={() => store.resolveConflict(doc.id, 'refresh')}><RefreshCw size={14} /> 刷新到最新版本并重新对照（现场归档留痕）</Button>
+        <Button variant="outline" onClick={() => store.resolveConflict(doc.id, 'discard')}>放弃该工作稿</Button>
+      </div>
+    </Card>
+  );
+}
+
 function BatchesPage() {
-  const { documents } = useDisclosureStore();
+  const documents = useDisclosureStore((state) => state.documents);
   const [selected, setSelected] = useState<string[]>(['DOC-00418']);
   const activeDoc = documents.find((doc) => doc.id === selected[0]) ?? documents[0];
   return (
@@ -387,7 +767,7 @@ function BatchesPage() {
         <Card className="batch-content">
           <div className="card-title"><Tags size={17} /><strong>文档与案件问题映射</strong><span>{selected.length} 已选择</span></div>
           <div className="batch-table">
-            {documents.map((doc) => <label key={doc.id} className="batch-row"><input type="checkbox" checked={selected.includes(doc.id)} onChange={() => setSelected((ids) => ids.includes(doc.id) ? ids.filter((id) => id !== doc.id) : [...ids, doc.id])} /><FileText size={17} /><div><strong>{doc.title}</strong><span>{doc.id} · {doc.issue}</span></div><Badge tone={doc.status === '可发布' ? 'green' : 'amber'}>{doc.status}</Badge></label>)}
+            {documents.map((doc) => <label key={doc.id} className="batch-row"><input type="checkbox" checked={selected.includes(doc.id)} onChange={() => setSelected((ids) => ids.includes(doc.id) ? ids.filter((id) => id !== doc.id) : [...ids, doc.id])} /><FileText size={17} /><div><strong>{doc.title}</strong><span>{doc.id} · v{doc.review.contentVersion} · {doc.issue}</span></div><Badge tone={doc.status === '可发布' ? 'green' : 'amber'}>{doc.status}</Badge></label>)}
           </div>
           <div className="tag-editor"><h3>标签与分发级</h3><div className="tag-options">{(['合同问题', '设备缺陷', '现场安全', '损害赔偿', '仅律师可见']).map((tag, index) => <span key={tag} className={index < 3 ? 'selected' : ''}>{tag}</span>)}</div><label>导出清单说明<textarea defaultValue="按案卷编号升序导出，保留去密版本、操作者与审批时间。" /></label><Button>保存批次设置</Button></div>
         </Card>
