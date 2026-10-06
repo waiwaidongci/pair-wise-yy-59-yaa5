@@ -35,7 +35,7 @@ import * as pdfjs from 'pdfjs-dist';
 import workerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
 import { Badge, Button, Card, Dialog, Tabs, X } from './components/ui';
-import { useDisclosureStore, type DisclosureRecord } from './store';
+import { useDisclosureStore, REVIEWERS, type DisclosureRecord } from './store';
 
 pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
 
@@ -356,21 +356,238 @@ function QualityPage() {
     { id: 'image-boundary', label: '图像边界残片', detail: '逐页比较遮蔽边界 2mm 区域' },
     { id: 'metadata', label: '文档元数据清理', detail: '作者、修订人、批注和隐藏字段' }
   ];
+
+  const [reviewerId, setReviewerId] = useState<string>('A');
+  const [drafts, setDrafts] = useState<Record<string, { decision: 'approve' | 'reject'; note: string }>>({
+    A: { decision: 'approve', note: '' },
+    B: { decision: 'approve', note: '' }
+  });
+  const [baseVersions, setBaseVersions] = useState<Record<string, number>>({
+    A: doc.version,
+    B: doc.version
+  });
+  const [conflict, setConflict] = useState<{
+    open: boolean;
+    type: 'version-conflict' | 'locked';
+    message: string;
+    draft: { decision: 'approve' | 'reject'; note: string };
+    currentVersion?: number;
+  } | null>(null);
+  const [snapshotError, setSnapshotError] = useState<string | null>(null);
+
+  const reviewer = REVIEWERS.find((r) => r.id === reviewerId)!;
+  const draft = drafts[reviewerId];
+  const baseVersion = baseVersions[reviewerId];
+  const conclusion = doc.reviewConclusions.find((c) => c.reviewerId === reviewerId);
+  const otherConclusion = doc.reviewConclusions.find((c) => c.reviewerId !== reviewerId);
+
+  // The snapshot is valid only when its version matches the current document
+  // version. Any region / check / metadata change bumps the version and leaves
+  // the snapshot stale until the pages are re-compared and a new snapshot is made.
+  const snapshotStatus: 'none' | 'valid' | 'stale' = !doc.snapshot
+    ? 'none'
+    : doc.snapshot.status === 'valid' && doc.snapshot.version === doc.version
+      ? 'valid'
+      : 'stale';
+
+  const submittedCount = doc.reviewConclusions.length;
+  const canApprove =
+    doc.status !== '可发布' &&
+    snapshotStatus === 'valid' &&
+    doc.reviewConclusions.some((c) => c.reviewerId === 'A' && c.decision === 'approve') &&
+    doc.reviewConclusions.some((c) => c.reviewerId === 'B' && c.decision === 'approve') &&
+    Object.values(doc.reviewChecks).every((value) => value) &&
+    doc.metadataCleaned;
+
+  const switchReviewer = (id: string) => {
+    setReviewerId(id);
+    setBaseVersions((prev) => ({ ...prev, [id]: doc.version }));
+  };
+
+  const updateDraft = (patch: Partial<{ decision: 'approve' | 'reject'; note: string }>) => {
+    setDrafts((prev) => ({ ...prev, [reviewerId]: { ...prev[reviewerId], ...patch } }));
+  };
+
+  const handleSubmit = () => {
+    const result = store.submitReviewConclusion(doc.id, reviewerId, draft.decision, draft.note, baseVersion);
+    if (!result.ok) {
+      // Preserve the reviewer's scene (decision + note) in the conflict dialog.
+      setConflict({
+        open: true,
+        type: result.error === 'version-conflict' ? 'version-conflict' : 'locked',
+        message: result.message,
+        draft: { ...draft },
+        currentVersion: result.currentVersion
+      });
+    }
+  };
+
+  const handleRebase = () => {
+    if (conflict?.currentVersion !== undefined) {
+      setBaseVersions((prev) => ({ ...prev, [reviewerId]: conflict.currentVersion! }));
+    }
+    setConflict(null);
+  };
+
+  const handleCreateSnapshot = () => {
+    setSnapshotError(null);
+    const result = store.createSnapshot(doc.id);
+    if (!result.ok && result.error === 'write-failed') {
+      setSnapshotError(result.message);
+    }
+  };
+
+  const handleRetrySnapshot = () => {
+    setSnapshotError(null);
+    const result = store.retrySnapshot(doc.id);
+    if (!result.ok && result.error === 'write-failed') {
+      setSnapshotError(result.message);
+    }
+  };
+
+  const handleApprove = () => {
+    store.markReady(doc.id);
+  };
+
   return (
-    <div className="page">
-      <header className="page-heading"><div><small>QUALITY ASSURANCE / SIDE-BY-SIDE</small><h1>发布质控双人复核</h1><p>并排检查原始页与发布页，所有差异必须留下复核结论。</p></div><Button><FileCheck2 size={16} /> 导出发布清单</Button></header>
+    <div className="page quality-page">
+      <header className="page-heading">
+        <div>
+          <small>QUALITY ASSURANCE / SIDE-BY-SIDE</small>
+          <h1>发布质控双人复核</h1>
+          <p>区域、复核项与发布快照共用同一版本；先到者锁定，后到者见冲突并保留现场。</p>
+        </div>
+        <Button><FileCheck2 size={16} /> 导出发布清单</Button>
+      </header>
       <div className="comparison-banner">
-        <div><Eye size={17} /><strong>{doc.title}</strong><span>版本 3.4 · 双人复核</span></div>
-        <Badge tone="amber">等待复审员 2/2</Badge>
+        <div><Eye size={17} /><strong>{doc.title}</strong><span>版本 v{doc.version} · 双人复核</span>
+          <Badge tone={snapshotStatus === 'valid' ? 'green' : snapshotStatus === 'stale' ? 'red' : 'neutral'}>
+            {snapshotStatus === 'valid' ? '快照有效' : snapshotStatus === 'stale' ? '快照已失效' : '未创建快照'}
+          </Badge>
+        </div>
+        <Badge tone="amber">已提交 {submittedCount}/2</Badge>
       </div>
       <div className="compare-grid">
         <Card className="compare-panel"><div className="compare-head"><span>原始页</span><Badge tone="neutral">源文件</Badge></div><div className="compare-page"><PdfPage pageNumber={1} /></div></Card>
         <Card className="compare-panel"><div className="compare-head"><span>发布页</span><Badge tone="green">已遮蔽</Badge></div><div className="compare-page redacted-preview"><PdfPage pageNumber={1} redacted /><div className="demo-mask mask-one" /><div className="demo-mask mask-two" /></div></Card>
       </div>
       <div className="quality-bottom">
-        <Card className="checks-card"><div className="card-title"><ClipboardCheck size={17} /><strong>发布前校验项</strong></div>{checks.map((check) => <button className="check-row" key={check.id} onClick={() => store.toggleReviewCheck(check.id)}><span className={store.reviewChecks[check.id] ? 'checked' : ''}>{store.reviewChecks[check.id] && <Check size={13} />}</span><div><strong>{check.label}</strong><small>{check.detail}</small></div></button>)}</Card>
-        <Card className="decision-card"><div className="card-title"><ShieldCheck size={17} /><strong>复核结论</strong></div><p>本批次共有 <b>{doc.redactions.length}</b> 个去密区域，其中已确认 {doc.redactions.filter((item) => item.status === 'confirmed').length} 个。</p><label><input type="checkbox" checked={store.metadataCleaned} onChange={store.toggleMetadata} /> 已确认元数据清理</label><div className="decision-actions"><Button variant="outline"><ArrowLeft size={15} /> 退回补件</Button><Button disabled={!store.metadataCleaned || Object.values(store.reviewChecks).some((value) => !value)} onClick={store.markReady}><Check size={15} /> 通过并标记可发布</Button></div></Card>
+        <Card className="checks-card">
+          <div className="card-title"><ClipboardCheck size={17} /><strong>发布前校验项</strong></div>
+          {checks.map((check) => (
+            <button className="check-row" key={check.id} onClick={() => store.toggleReviewCheck(doc.id, check.id)}>
+              <span className={doc.reviewChecks[check.id] ? 'checked' : ''}>{doc.reviewChecks[check.id] && <Check size={13} />}</span>
+              <div><strong>{check.label}</strong><small>{check.detail}</small></div>
+            </button>
+          ))}
+        </Card>
+        <Card className="decision-card">
+          <div className="card-title"><ShieldCheck size={17} /><strong>复核结论</strong></div>
+          <p>本批次共有 <b>{doc.redactions.length}</b> 个去密区域，其中已确认 {doc.redactions.filter((item) => item.status === 'confirmed').length} 个。</p>
+
+          <div className="reviewer-tabs">
+            {REVIEWERS.map((r) => (
+              <button key={r.id} className={reviewerId === r.id ? 'active' : ''} onClick={() => switchReviewer(r.id)}>
+                {r.role} · {r.name}
+                {doc.reviewConclusions.some((c) => c.reviewerId === r.id) && <Check size={12} />}
+              </button>
+            ))}
+          </div>
+
+          <div className="reviewer-block">
+            <div className="reviewer-head">
+              <strong>{reviewer.role} · {reviewer.name}</strong>
+              <Badge tone={conclusion ? 'green' : 'neutral'}>{conclusion ? '已提交' : '未提交'}</Badge>
+              {conclusion && <small>基于 v{conclusion.baseVersion}</small>}
+            </div>
+            {otherConclusion && (
+              <div className="other-conclusion">
+                <p><b>{otherConclusion.reviewerName}</b> 已提交结论：{otherConclusion.decision === 'approve' ? '通过' : '退回'}（基于 v{otherConclusion.baseVersion}）</p>
+                <small>意见：{otherConclusion.note}</small>
+              </div>
+            )}
+            <label>结论
+              <select value={draft.decision} onChange={(event) => updateDraft({ decision: event.target.value as 'approve' | 'reject' })} disabled={doc.status === '可发布'}>
+                <option value="approve">通过</option>
+                <option value="reject">退回</option>
+              </select>
+            </label>
+            <label>复核意见
+              <textarea value={draft.note} onChange={(event) => updateDraft({ note: event.target.value })} placeholder="记录原页与发布页对照结果..." disabled={doc.status === '可发布'} />
+            </label>
+            <Button onClick={handleSubmit} disabled={doc.status === '可发布'}><Check size={15} /> 提交结论并锁定版本 v{baseVersion}</Button>
+            {conclusion && <small className="muted">您已提交基于 v{conclusion.baseVersion} 的结论。</small>}
+          </div>
+
+          <div className="snapshot-block">
+            <div className="card-title"><FileCheck2 size={17} /><strong>发布快照</strong></div>
+            <p>当前版本 v{doc.version} · {snapshotStatus === 'valid' ? '快照有效，可批准' : snapshotStatus === 'stale' ? '快照已失效' : '尚未创建快照'}</p>
+            {snapshotStatus === 'stale' && (
+              <div className="snapshot-warning">
+                <AlertTriangle size={14} />
+                <span>区域或复核项已变更，快照失效。请重新对照原页与发布页后创建快照。</span>
+              </div>
+            )}
+            <Button variant="outline" onClick={handleCreateSnapshot} disabled={snapshotStatus === 'valid' || doc.status === '可发布'}>
+              {snapshotStatus === 'valid' ? '快照已有效' : '创建发布快照'}
+            </Button>
+            {snapshotError && (
+              <div className="snapshot-error">
+                <AlertTriangle size={14} />
+                <span>{snapshotError}</span>
+                <Button variant="outline" onClick={handleRetrySnapshot}><Copy size={14} /> 按文档编号重试</Button>
+              </div>
+            )}
+            {doc.snapshot && (
+              <small className="muted">快照 {doc.snapshot.id} · 版本 v{doc.snapshot.version} · {doc.snapshot.status === 'valid' ? '有效' : '已失效'}</small>
+            )}
+          </div>
+
+          <label className="metadata-check">
+            <input type="checkbox" checked={doc.metadataCleaned} onChange={() => store.toggleMetadata(doc.id)} disabled={doc.status === '可发布'} />
+            已确认元数据清理
+          </label>
+
+          <div className="decision-actions">
+            <Button variant="outline"><ArrowLeft size={15} /> 退回补件</Button>
+            <Button disabled={!canApprove} onClick={handleApprove}><Check size={15} /> 通过并标记可发布</Button>
+          </div>
+          {!canApprove && doc.status !== '可发布' && (
+            <small className="muted">需：快照有效 + 双人通过 + 全部校验项通过 + 元数据已清理。</small>
+          )}
+
+          <div className="records-block">
+            <div className="card-title"><ClipboardCheck size={17} /><strong>处理记录</strong></div>
+            {doc.processingRecords.slice(-5).reverse().map((rec) => (
+              <div key={rec.id} className="record-row">
+                <span className="record-time">{new Date(rec.at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}</span>
+                <div><strong>{rec.action}</strong><small>{rec.actor} · {rec.detail}</small></div>
+              </div>
+            ))}
+          </div>
+        </Card>
       </div>
+
+      <Dialog.Root open={conflict?.open ?? false} onOpenChange={(open) => !open && setConflict(null)}>
+        <Dialog.Portal>
+          <Dialog.Overlay className="dialog-overlay" />
+          <Dialog.Content className="dialog-content">
+            <Dialog.Title>提交冲突</Dialog.Title>
+            <Dialog.Description>{conflict?.message}</Dialog.Description>
+            <div className="conflict-scene">
+              <strong>已保留您的现场：</strong>
+              <p>结论：{conflict?.draft.decision === 'approve' ? '通过' : '退回'}</p>
+              <p>意见：{conflict?.draft.note || '（未填写）'}</p>
+            </div>
+            <div className="conflict-actions">
+              {conflict?.type === 'version-conflict' && conflict.currentVersion !== undefined && (
+                <Button onClick={handleRebase}>重新基于最新版本 (v{conflict.currentVersion}) 并保留现场</Button>
+              )}
+              <Dialog.Close asChild><Button variant="outline">关闭</Button></Dialog.Close>
+            </div>
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog.Root>
     </div>
   );
 }
